@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+"""
+Run the DoReFa weight-only experiments described in SPEC.md.
+
+Notes:
+- This is NOT GPTQ/AWQ packing; it keeps weights in BF16 but restricts them to
+  discrete levels (per-tensor symmetric-ish quantization).
+- Outliers are preserved (left unquantized) based on per-tensor quantiles.
+- Optional: also quantize inter-layer activations via forward hooks (W+A).
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import os
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+
+DEFAULT_TEXT_PATH = "../../swift_train/lgqm.txt"
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    label: str
+    bits: Optional[int]
+    outlier_percentile: float = 1.0
+    act_bits: Optional[int] = None
+    act_outlier_percentile: float = 1.0
+
+
+def _resolve_internlm_snapshot_path(model_path: str) -> str:
+    path = Path(model_path)
+    if (path / "config.json").exists():
+        return str(path)
+    snapshots = sorted((path / "snapshots").glob("*"))
+    if not snapshots:
+        raise FileNotFoundError(f"Could not resolve InternLM snapshot path from: {model_path}")
+    return str(snapshots[-1])
+
+
+def _load_text(text_path: str, max_chars: int) -> str:
+    with open(text_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    return text[:max_chars] if len(text) > max_chars else text
+
+
+def _infer_layers(model) -> List[torch.nn.Module]:
+    # Common HF causal LM layouts.
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return list(model.model.layers)
+    if hasattr(model, "layers"):
+        return list(model.layers)
+    raise AttributeError("Unsupported model layout: cannot find transformer layers")
+
+
+def _iter_target_weights(
+    model,
+    target_layer_indices: Iterable[int],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    layers = _infer_layers(model)
+    for layer_idx in target_layer_indices:
+        layer = layers[layer_idx]
+
+        # Attention projections (Qwen/MiniCPM/Gemma-style)
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                proj = getattr(attn, proj_name, None)
+                if proj is None or not hasattr(proj, "weight"):
+                    continue
+                yield f"layer{layer_idx}.self_attn.{proj_name}.weight", proj.weight
+
+        # MLP projections (Qwen/MiniCPM/Gemma-style)
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                proj = getattr(mlp, proj_name, None)
+                if proj is None or not hasattr(proj, "weight"):
+                    continue
+                yield f"layer{layer_idx}.mlp.{proj_name}.weight", proj.weight
+
+        # InternLM2-style attention/feed-forward.
+        attn = getattr(layer, "attention", None)
+        if attn is not None:
+            for proj_name in ("wqkv", "wo"):
+                proj = getattr(attn, proj_name, None)
+                if proj is None or not hasattr(proj, "weight"):
+                    continue
+                yield f"layer{layer_idx}.attention.{proj_name}.weight", proj.weight
+
+        ff = getattr(layer, "feed_forward", None)
+        if ff is not None:
+            for proj_name in ("w1", "w2", "w3"):
+                proj = getattr(ff, proj_name, None)
+                if proj is None or not hasattr(proj, "weight"):
+                    continue
+                yield f"layer{layer_idx}.feed_forward.{proj_name}.weight", proj.weight
+
+
+def _compute_quantile_bounds(
+    weight: torch.Tensor,
+    outlier_percentile: float,
+    *,
+    sample_size: int,
+) -> Tuple[float, float]:
+    # Keep (outlier_percentile)% on each tail unquantized, matching SPEC.md pseudocode.
+    q = outlier_percentile / 100.0
+    wf = weight.detach().float().reshape(-1)
+    if sample_size > 0 and wf.numel() > sample_size:
+        # Deterministic strided sampling avoids expensive full-tensor quantiles.
+        step = max(1, wf.numel() // sample_size)
+        wf = wf[::step][:sample_size]
+
+    # Use CPU quantiles to avoid GPU-side full sorts.
+    sample = wf.detach().cpu().numpy()
+    w_min = float(np.quantile(sample, q))
+    w_max = float(np.quantile(sample, 1.0 - q))
+    return float(w_min), float(w_max)
+
+
+def _compute_tensor_quantile_bounds(
+    tensor: torch.Tensor,
+    outlier_percentile: float,
+    *,
+    sample_size: int,
+) -> Tuple[float, float]:
+    q = outlier_percentile / 100.0
+    tf = tensor.detach().float().reshape(-1)
+    if sample_size > 0 and tf.numel() > sample_size:
+        step = max(1, tf.numel() // sample_size)
+        tf = tf[::step][:sample_size]
+    sample = tf.detach().cpu().numpy()
+    t_min = float(np.quantile(sample, q))
+    t_max = float(np.quantile(sample, 1.0 - q))
+    return float(t_min), float(t_max)
+
+
+def _load_or_build_bounds_cache(
+    *,
+    cache_path: Path,
+    model,
+    target_layer_indices: List[int],
+    outlier_percentile: float,
+    sample_size: int,
+) -> Dict[str, Tuple[float, float]]:
+    if cache_path.exists():
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return {k: (float(v[0]), float(v[1])) for k, v in payload.items()}
+
+    bounds: Dict[str, Tuple[float, float]] = {}
+    for name, weight in _iter_target_weights(model, target_layer_indices):
+        bounds[name] = _compute_quantile_bounds(weight, outlier_percentile, sample_size=sample_size)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(bounds, ensure_ascii=False, indent=2), encoding="utf-8")
+    return bounds
+
+
+def _dorefa_quantize_inplace(
+    weight: torch.Tensor,
+    *,
+    num_bits: int,
+    bounds: Tuple[float, float],
+) -> None:
+    # SPEC.md uses a symmetric integer range but scales using w_max only.
+    qmin = -(2 ** (num_bits - 1) - 1)
+    qmax = 2 ** (num_bits - 1) - 1
+
+    w_min, w_max = bounds
+    wf = weight.detach().float()
+    outlier_mask = (wf < w_min) | (wf > w_max)
+
+    scale = (w_max / qmax) if w_max > 0 else 1.0
+    wq = torch.clamp(torch.round(wf / scale), qmin, qmax) * scale
+    wq = wq.to(dtype=weight.dtype)
+
+    weight.data.copy_(torch.where(outlier_mask, weight.data, wq))
+
+
+def _dorefa_quantize_tensor(
+    tensor: torch.Tensor,
+    *,
+    num_bits: int,
+    bounds: Tuple[float, float],
+) -> torch.Tensor:
+    qmin = -(2 ** (num_bits - 1) - 1)
+    qmax = 2 ** (num_bits - 1) - 1
+
+    t_min, t_max = bounds
+    tf = tensor.detach().float()
+    outlier_mask = (tf < t_min) | (tf > t_max)
+
+    scale = (t_max / qmax) if t_max > 0 else 1.0
+    tq = torch.clamp(torch.round(tf / scale), qmin, qmax) * scale
+    tq = tq.to(dtype=tensor.dtype)
+    return torch.where(outlier_mask, tensor, tq)
+
+
+def _load_or_build_activation_bounds_cache(
+    *,
+    cache_path: Path,
+    model,
+    tokenizer,
+    calib_text: str,
+    target_layer_indices: List[int],
+    outlier_percentile: float,
+    seq_len: int,
+    sample_size: int,
+) -> Dict[int, Tuple[float, float]]:
+    if cache_path.exists():
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        bounds_raw = payload.get("bounds", payload)
+        return {int(k): (float(v[0]), float(v[1])) for k, v in bounds_raw.items()}
+
+    inputs = tokenizer(calib_text, return_tensors="pt", truncation=True, max_length=seq_len)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    out = model(**inputs, use_cache=False, output_hidden_states=True, return_dict=True)
+    hidden_states = list(out.hidden_states or [])
+    if not hidden_states:
+        raise RuntimeError("Model did not return hidden_states; cannot calibrate activation quantization.")
+
+    bounds: Dict[int, Tuple[float, float]] = {}
+    for layer_idx in target_layer_indices:
+        hs = hidden_states[layer_idx + 1]
+        bounds[layer_idx] = _compute_tensor_quantile_bounds(
+            hs, outlier_percentile, sample_size=sample_size
+        )
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_payload = {
+        "seq_len": int(seq_len),
+        "outlier_percentile": float(outlier_percentile),
+        "sample_size": int(sample_size),
+        "bounds": {str(k): [float(v[0]), float(v[1])] for k, v in bounds.items()},
+    }
+    cache_path.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return bounds
+
+
+def _register_activation_quant_hooks(
+    model,
+    *,
+    target_layer_indices: List[int],
+    bounds_by_layer: Dict[int, Tuple[float, float]],
+    num_bits: int,
+) -> List[Any]:
+    layers = _infer_layers(model)
+    handles: List[Any] = []
+
+    def make_hook(layer_idx: int):
+        def hook(_module, _inputs, output):
+            bounds = bounds_by_layer.get(layer_idx)
+            if bounds is None:
+                return output
+            if isinstance(output, tuple) and output and torch.is_tensor(output[0]):
+                hs = output[0]
+                hs_q = _dorefa_quantize_tensor(hs, num_bits=num_bits, bounds=bounds)
+                return (hs_q,) + output[1:]
+            if torch.is_tensor(output):
+                return _dorefa_quantize_tensor(output, num_bits=num_bits, bounds=bounds)
+            return output
+
+        return hook
+
+    for layer_idx in target_layer_indices:
+        handles.append(layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+    return handles
+
+
+@torch.inference_mode()
+def _calculate_ppl(
+    model,
+    tokenizer,
+    text: str,
+    *,
+    n_ctx: int = 2048,
+    stride: Optional[int] = None,
+) -> float:
+    stride = stride or (n_ctx // 2)
+    encodings = tokenizer(text, truncation=False, return_tensors="pt")
+    input_ids = encodings.input_ids.to(model.device)
+    attention_mask = getattr(encodings, "attention_mask", None)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(model.device)
+
+    seq_len = input_ids.size(1)
+    total_nll = 0.0
+    total_tokens = 0
+    prev_end_loc = 0
+
+    for begin_loc in range(0, seq_len, stride):
+        end_loc = min(begin_loc + n_ctx, seq_len)
+        trg_len = end_loc - prev_end_loc
+
+        input_chunk = input_ids[:, begin_loc:end_loc]
+        if attention_mask is not None:
+            attn_chunk = attention_mask[:, begin_loc:end_loc]
+        else:
+            attn_chunk = torch.ones_like(input_chunk)
+        target_ids = input_chunk.clone()
+        target_ids[:, :-trg_len] = -100
+
+        outputs = model(input_chunk, attention_mask=attn_chunk, labels=target_ids, use_cache=False)
+        loss = outputs.loss.float()
+
+        total_nll += (loss.item() * trg_len)
+        total_tokens += trg_len
+
+        prev_end_loc = end_loc
+        if end_loc == seq_len:
+            break
+
+    if total_tokens == 0:
+        return float("inf")
+    return float(math.exp(total_nll / total_tokens))
+
+
+@torch.inference_mode()
+def _generate_samples(
+    model,
+    tokenizer,
+    prompts: List[str],
+    *,
+    max_new_tokens: int = 80,
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+) -> List[Dict[str, str]]:
+    samples: List[Dict[str, str]] = []
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=getattr(tokenizer, "pad_token_id", None),
+        )
+        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        samples.append({"prompt": prompt, "continuation": generated[len(prompt) :].strip()})
+    return samples
+
+
+def _seed_all(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> Tuple[Any, Any]:
+    tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if use_fast is not None:
+        tokenizer_kwargs["use_fast"] = use_fast
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": True,
+    }
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        model.to("cuda")
+
+    model.eval()
+    return model, tokenizer
+
+
+def _run_single(
+    *,
+    model_key: str,
+    model_path: str,
+    use_fast_tokenizer: Optional[bool],
+    text_path: str,
+    max_chars: int,
+    results_dir: Path,
+    prompts: List[str],
+    n_ctx: int,
+    stride: int,
+    config: ExperimentConfig,
+    seed: int,
+    quantile_sample_size: int,
+    act_calib_chars: int,
+    act_calib_seq_len: int,
+) -> Dict[str, Any]:
+    _seed_all(seed)
+    model, tokenizer = _load_model_and_tokenizer(model_path, use_fast=use_fast_tokenizer)
+
+    layers = _infer_layers(model)
+    target_layers = list(range(1, len(layers) - 1))
+
+    if config.bits is not None:
+        bounds_cache_path = (
+            results_dir
+            / "quantile_cache"
+            / f"{model_key}_outlier{config.outlier_percentile:g}.json"
+        )
+
+        bounds = _load_or_build_bounds_cache(
+            cache_path=bounds_cache_path,
+            model=model,
+            target_layer_indices=target_layers,
+            outlier_percentile=config.outlier_percentile,
+            sample_size=quantile_sample_size,
+        )
+        for name, weight in _iter_target_weights(model, target_layers):
+            _dorefa_quantize_inplace(weight, num_bits=config.bits, bounds=bounds[name])
+
+    hooks: List[Any] = []
+    if config.act_bits is not None:
+        calib_text = _load_text(text_path, max_chars=act_calib_chars)
+        act_cache_path = (
+            results_dir
+            / "activation_cache"
+            / f"{model_key}_W{config.bits}_outlier{config.outlier_percentile:g}_A{config.act_bits}_outlier{config.act_outlier_percentile:g}_seqlen{act_calib_seq_len}.json"
+        )
+        act_bounds = _load_or_build_activation_bounds_cache(
+            cache_path=act_cache_path,
+            model=model,
+            tokenizer=tokenizer,
+            calib_text=calib_text,
+            target_layer_indices=target_layers,
+            outlier_percentile=config.act_outlier_percentile,
+            seq_len=act_calib_seq_len,
+            sample_size=quantile_sample_size,
+        )
+        hooks = _register_activation_quant_hooks(
+            model,
+            target_layer_indices=target_layers,
+            bounds_by_layer=act_bounds,
+            num_bits=int(config.act_bits),
+        )
+
+    text = _load_text(text_path, max_chars=max_chars)
+    ppl = _calculate_ppl(model, tokenizer, text, n_ctx=n_ctx, stride=stride)
+    samples = _generate_samples(model, tokenizer, prompts)
+    for h in hooks:
+        h.remove()
+
+    payload: Dict[str, Any] = {
+        "model_key": model_key,
+        "model_path": model_path,
+        "config": config.label,
+        "num_bits": config.bits,
+        "outlier_percentile": config.outlier_percentile,
+        "act_bits": config.act_bits,
+        "act_outlier_percentile": config.act_outlier_percentile,
+        "act_calib_chars": act_calib_chars,
+        "act_calib_seq_len": act_calib_seq_len,
+        "quantile_sample_size": quantile_sample_size,
+        "target_layers": target_layers,
+        "ppl": round(float(ppl), 6),
+        "timestamp": datetime.now().isoformat(),
+        "seed": seed,
+        "prompts": prompts,
+        "samples": samples,
+    }
+
+    # Cleanup aggressively between runs.
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return payload
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("results"),
+        help="Directory to write JSON results and caches.",
+    )
+    parser.add_argument("--text-path", default=DEFAULT_TEXT_PATH)
+    parser.add_argument("--max-chars", type=int, default=150000)
+    parser.add_argument("--n-ctx", type=int, default=2048)
+    parser.add_argument("--stride", type=int, default=1024)
+    parser.add_argument(
+        "--quantile-sample-size",
+        type=int,
+        default=200_000,
+        help="Per-tensor sample size for quantile estimation (0 = full tensor, slow).",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--act-calib-chars", type=int, default=20000)
+    parser.add_argument("--act-calib-seq-len", type=int, default=256)
+    parser.add_argument(
+        "--models",
+        default="qwen3,minicpm,internlm,gemma3",
+        help="Comma-separated model keys to run: qwen3,minicpm,internlm,gemma3",
+    )
+    parser.add_argument(
+        "--include-wa",
+        action="store_true",
+        help="Include weight+activation (W+A) quantization configs for W>=6bit.",
+    )
+    parser.add_argument(
+        "--include-outlier0",
+        action="store_true",
+        help="Add outlier=0% ablations (i.e., quantize all values; no outlier preservation).",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip configs whose output JSON already exists in --results-dir.",
+    )
+    parser.add_argument(
+        "--config-set",
+        choices=("full", "wa"),
+        default="full",
+        help="Which configs to run: full=SPEC configs (optionally +W+A), wa=BF16 + 6/8-bit W and W+A only.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.config_set == "wa":
+        args.include_wa = True
+    results_dir: Path = args.results_dir
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    prompts = [
+        "萧子山看着眼前的虫洞，心中充满了",
+        "文总说道：",
+        "穿越到明朝之后，他们首先要解决的是",
+        "临高启明计划的核心是",
+    ]
+
+    experiments: Dict[str, Dict[str, Any]] = {
+        "qwen3": {
+            "model_path": "../../Qwen/Qwen3-1.7B/",
+            "use_fast_tokenizer": False,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("5-bit W (0.1%)", 5, 0.1),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("6-bit W (0.1%)", 6, 0.1),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "minicpm": {
+            "model_path": "../MiniCPM-2B-sft-bf16/",
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "minicpm4_0p5b": {
+            "model_path": "../MiniCPM4-0.5B",
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "internlm": {
+            "model_path": _resolve_internlm_snapshot_path(
+                "../models--internlm--internlm2_5-1_8b"
+            ),
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "gemma3": {
+            "model_path": "../gemma-3-1b-it/",
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+    }
+
+    if args.include_outlier0:
+        for spec in experiments.values():
+            cfgs: List[ExperimentConfig] = list(spec["configs"])
+            bits_present = sorted({int(c.bits) for c in cfgs if c.bits is not None})
+            extra: List[ExperimentConfig] = []
+            for bits in bits_present:
+                extra.append(ExperimentConfig(f"{bits}-bit W (0%)", bits, 0.0))
+            spec["configs"] = cfgs + extra
+
+    if args.include_wa:
+        for spec in experiments.values():
+            cfgs: List[ExperimentConfig] = list(spec["configs"])
+            extra: List[ExperimentConfig] = []
+            for c in cfgs:
+                if c.bits is None:
+                    continue
+                if int(c.bits) < 6:
+                    continue
+                if abs(float(c.outlier_percentile) - 1.0) > 1e-9:
+                    # Keep W+A matrix small; only run the default outlier setting.
+                    continue
+                extra.append(
+                    ExperimentConfig(
+                        label=f"{int(c.bits)}-bit W+A ({c.outlier_percentile:g}%)",
+                        bits=int(c.bits),
+                        outlier_percentile=float(c.outlier_percentile),
+                        act_bits=int(c.bits),
+                        act_outlier_percentile=float(c.outlier_percentile),
+                    )
+                )
+            if args.include_outlier0:
+                for bits in sorted({int(c.bits) for c in cfgs if c.bits is not None and int(c.bits) >= 6}):
+                    extra.append(
+                        ExperimentConfig(
+                            label=f"{bits}-bit W+A (0%)",
+                            bits=bits,
+                            outlier_percentile=0.0,
+                            act_bits=bits,
+                            act_outlier_percentile=0.0,
+                        )
+                    )
+                    # Mixed outlier ablations to isolate which side matters (W vs activation).
+                    extra.append(
+                        ExperimentConfig(
+                            label=f"{bits}-bit W(outlier=1%)+A(outlier=0%)",
+                            bits=bits,
+                            outlier_percentile=1.0,
+                            act_bits=bits,
+                            act_outlier_percentile=0.0,
+                        )
+                    )
+                    extra.append(
+                        ExperimentConfig(
+                            label=f"{bits}-bit W(outlier=0%)+A(outlier=1%)",
+                            bits=bits,
+                            outlier_percentile=0.0,
+                            act_bits=bits,
+                            act_outlier_percentile=1.0,
+                        )
+                    )
+            spec["configs"] = cfgs + extra
+
+    if args.config_set == "wa":
+        for spec in experiments.values():
+            cfgs: List[ExperimentConfig] = list(spec["configs"])
+            filtered: List[ExperimentConfig] = []
+            for c in cfgs:
+                if c.bits is None:
+                    filtered.append(c)
+                    continue
+                if int(c.bits) not in (6, 8):
+                    continue
+                if abs(float(c.outlier_percentile) - 1.0) > 1e-9 and abs(float(c.outlier_percentile) - 0.0) > 1e-9:
+                    continue
+                # Keep both W-only and W+A for these bits.
+                filtered.append(c)
+            spec["configs"] = filtered
+
+    model_keys = [k.strip() for k in args.models.split(",") if k.strip()]
+    for model_key in model_keys:
+        if model_key not in experiments:
+            raise SystemExit(f"Unknown model key: {model_key}")
+
+    all_results: List[Dict[str, Any]] = []
+    for model_key in model_keys:
+        spec = experiments[model_key]
+        model_path = spec["model_path"]
+        use_fast_tokenizer = spec["use_fast_tokenizer"]
+        configs: List[ExperimentConfig] = spec["configs"]
+
+        print("=" * 90)
+        print(f"[Model] {model_key} | path={model_path}")
+        print("=" * 90)
+
+        for cfg in configs:
+            print(f"\n[Run] {cfg.label} | bits={cfg.bits} | outlier={cfg.outlier_percentile}%")
+            out_name = (
+                f"{model_key}_bf16.json"
+                if cfg.bits is None
+                else (
+                    f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}.json"
+                    if cfg.act_bits is None
+                    else f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}_act{cfg.act_bits}bit_actoutlier{cfg.act_outlier_percentile:g}.json"
+                )
+            )
+            out_path = results_dir / out_name
+            if args.skip_existing and out_path.exists():
+                print(f"[Skip] Exists: {out_path}")
+                continue
+
+            payload = _run_single(
+                model_key=model_key,
+                model_path=model_path,
+                use_fast_tokenizer=use_fast_tokenizer,
+                text_path=args.text_path,
+                max_chars=args.max_chars,
+                results_dir=results_dir,
+                prompts=prompts,
+                n_ctx=args.n_ctx,
+                stride=args.stride,
+                config=cfg,
+                seed=args.seed,
+                quantile_sample_size=args.quantile_sample_size,
+                act_calib_chars=args.act_calib_chars,
+                act_calib_seq_len=args.act_calib_seq_len,
+            )
+
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            all_results.append(payload)
+            print(f"[Done] PPL={payload['ppl']} -> {out_path}")
+
+    summary_path = results_dir / "summary.json"
+    merged_results: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    if summary_path.exists():
+        try:
+            existing = json.loads(summary_path.read_text(encoding="utf-8"))
+            for item in existing:
+                key = (
+                    item.get("model_key"),
+                    item.get("num_bits"),
+                    float(item.get("outlier_percentile", 1.0)),
+                    item.get("act_bits", None),
+                    float(item.get("act_outlier_percentile", 1.0)),
+                )
+                merged_results[key] = item
+        except Exception:
+            # If an existing summary is corrupted or incompatible, overwrite it with the new run.
+            merged_results = {}
+
+    for item in all_results:
+        key = (
+            item.get("model_key"),
+            item.get("num_bits"),
+            float(item.get("outlier_percentile", 1.0)),
+            item.get("act_bits", None),
+            float(item.get("act_outlier_percentile", 1.0)),
+        )
+        merged_results[key] = item
+
+    final_results = list(merged_results.values())
+    final_results.sort(
+        key=lambda it: (
+            str(it.get("model_key", "")),
+            0 if it.get("num_bits") is None else 1,
+            0 if it.get("num_bits") is None else int(it.get("num_bits") or 0),
+            float(it.get("outlier_percentile", 1.0)),
+            0 if it.get("act_bits") is None else 1,
+            0 if it.get("act_bits") is None else int(it.get("act_bits") or 0),
+            float(it.get("act_outlier_percentile", 1.0)),
+        )
+    )
+
+    summary_path.write_text(json.dumps(final_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n✓ Wrote summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

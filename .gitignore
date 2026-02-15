@@ -184,3 +184,9 @@ example.py
 /gptqmodel_offload/
 /gptqmodel_ext/machete/generated/
 AGENT.md
+
+# Local experiment outputs / reports (SPEC quantization runs)
+results/
+
+# Copied FYI (contains generated HTML reports/logs; not part of library)
+scripts/quant/
