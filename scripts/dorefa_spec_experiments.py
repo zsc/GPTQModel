@@ -766,15 +766,16 @@ def main() -> None:
         print("=" * 90)
 
         for cfg in configs:
-            print(f"\n[Run] {cfg.label} | bits={cfg.bits} | outlier={cfg.outlier_percentile}%")
+            cfg_run = cfg.with_prefix("[ALLBLOCKS] " if args.quantize_all_blocks else "")
+            print(f"\n[Run] {cfg_run.label} | bits={cfg_run.bits} | outlier={cfg_run.outlier_percentile}%")
             scope_suffix = "_allblocks" if args.quantize_all_blocks else ""
             out_name = (
                 f"{model_key}_bf16{scope_suffix}.json"
-                if cfg.bits is None
+                if cfg_run.bits is None
                 else (
-                    f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}{scope_suffix}.json"
-                    if cfg.act_bits is None
-                    else f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}_act{cfg.act_bits}bit_actoutlier{cfg.act_outlier_percentile:g}{scope_suffix}.json"
+                    f"{model_key}_{cfg_run.bits}bit_outlier{cfg_run.outlier_percentile:g}{scope_suffix}.json"
+                    if cfg_run.act_bits is None
+                    else f"{model_key}_{cfg_run.bits}bit_outlier{cfg_run.outlier_percentile:g}_act{cfg_run.act_bits}bit_actoutlier{cfg_run.act_outlier_percentile:g}{scope_suffix}.json"
                 )
             )
             out_path = results_dir / out_name
@@ -792,7 +793,7 @@ def main() -> None:
                 prompts=prompts,
                 n_ctx=args.n_ctx,
                 stride=args.stride,
-                config=cfg,
+                config=cfg_run,
                 quantize_all_blocks=bool(args.quantize_all_blocks),
                 seed=args.seed,
                 quantile_sample_size=args.quantile_sample_size,
