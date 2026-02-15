@@ -30,7 +30,45 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
-DEFAULT_TEXT_PATH = "../../swift_train/lgqm.txt"
+def _load_dotenv(dotenv_path: Path) -> None:
+    """Minimal .env loader (avoid extra dependency).
+
+    Supports lines like `KEY=VALUE` and ignores blank lines / comments.
+    Existing environment variables are not overwritten.
+    """
+
+    try:
+        text = dotenv_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        os.environ.setdefault(key, val)
+
+
+def _maybe_load_dotenv() -> None:
+    # Prefer CWD, but also try repo root (scripts/..).
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env"]
+    for p in candidates:
+        if p.exists():
+            _load_dotenv(p)
+            break
+
+
+_maybe_load_dotenv()
+
+
+DEFAULT_TEXT_PATH = os.environ.get("SPEC_TEXT_PATH", "/workspace/zhousc6@xiaopeng.com/swift_train/lgqm.txt")
 
 
 @dataclass(frozen=True)
@@ -40,6 +78,17 @@ class ExperimentConfig:
     outlier_percentile: float = 1.0
     act_bits: Optional[int] = None
     act_outlier_percentile: float = 1.0
+
+    def with_prefix(self, prefix: str) -> "ExperimentConfig":
+        if not prefix:
+            return self
+        return ExperimentConfig(
+            label=f"{prefix}{self.label}",
+            bits=self.bits,
+            outlier_percentile=self.outlier_percentile,
+            act_bits=self.act_bits,
+            act_outlier_percentile=self.act_outlier_percentile,
+        )
 
 
 def _resolve_internlm_snapshot_path(model_path: str) -> str:
@@ -397,6 +446,7 @@ def _run_single(
     n_ctx: int,
     stride: int,
     config: ExperimentConfig,
+    quantize_all_blocks: bool,
     seed: int,
     quantile_sample_size: int,
     act_calib_chars: int,
@@ -406,13 +456,19 @@ def _run_single(
     model, tokenizer = _load_model_and_tokenizer(model_path, use_fast=use_fast_tokenizer)
 
     layers = _infer_layers(model)
-    target_layers = list(range(1, len(layers) - 1))
+    if quantize_all_blocks:
+        target_layers = list(range(0, len(layers)))
+        target_layer_mode = "all"
+    else:
+        target_layers = list(range(1, len(layers) - 1))
+        target_layer_mode = "middle"
 
     if config.bits is not None:
+        scope_suffix = "_allblocks" if quantize_all_blocks else ""
         bounds_cache_path = (
             results_dir
             / "quantile_cache"
-            / f"{model_key}_outlier{config.outlier_percentile:g}.json"
+            / f"{model_key}_outlier{config.outlier_percentile:g}{scope_suffix}.json"
         )
 
         bounds = _load_or_build_bounds_cache(
@@ -428,10 +484,11 @@ def _run_single(
     hooks: List[Any] = []
     if config.act_bits is not None:
         calib_text = _load_text(text_path, max_chars=act_calib_chars)
+        scope_suffix = "_allblocks" if quantize_all_blocks else ""
         act_cache_path = (
             results_dir
             / "activation_cache"
-            / f"{model_key}_W{config.bits}_outlier{config.outlier_percentile:g}_A{config.act_bits}_outlier{config.act_outlier_percentile:g}_seqlen{act_calib_seq_len}.json"
+            / f"{model_key}_W{config.bits}_outlier{config.outlier_percentile:g}_A{config.act_bits}_outlier{config.act_outlier_percentile:g}_seqlen{act_calib_seq_len}{scope_suffix}.json"
         )
         act_bounds = _load_or_build_activation_bounds_cache(
             cache_path=act_cache_path,
@@ -468,6 +525,7 @@ def _run_single(
         "act_calib_seq_len": act_calib_seq_len,
         "quantile_sample_size": quantile_sample_size,
         "target_layers": target_layers,
+        "target_layer_mode": target_layer_mode,
         "ppl": round(float(ppl), 6),
         "timestamp": datetime.now().isoformat(),
         "seed": seed,
@@ -531,6 +589,11 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help="Which configs to run: full=SPEC configs (optionally +W+A), wa=BF16 + 6/8-bit W and W+A only.",
     )
+    parser.add_argument(
+        "--quantize-all-blocks",
+        action="store_true",
+        help="Ablation: quantize ALL transformer blocks (default: keep first/last blocks in BF16).",
+    )
     return parser.parse_args()
 
 
@@ -550,7 +613,7 @@ def main() -> None:
 
     experiments: Dict[str, Dict[str, Any]] = {
         "qwen3": {
-            "model_path": "../../Qwen/Qwen3-1.7B/",
+            "model_path": os.environ.get("QWEN3_MODEL_PATH", "/publicdata/huggingface.co/Qwen/Qwen3-1.7B/"),
             "use_fast_tokenizer": False,
             "configs": [
                 ExperimentConfig("BF16 baseline", None, 1.0),
@@ -562,7 +625,7 @@ def main() -> None:
             ],
         },
         "minicpm": {
-            "model_path": "../MiniCPM-2B-sft-bf16/",
+            "model_path": os.environ.get("MINICPM_MODEL_PATH", "/workspace/zhousc6@xiaopeng.com/MiniCPM-2B-sft-bf16/"),
             "use_fast_tokenizer": None,
             "configs": [
                 ExperimentConfig("BF16 baseline", None, 1.0),
@@ -572,7 +635,7 @@ def main() -> None:
             ],
         },
         "minicpm4_0p5b": {
-            "model_path": "../MiniCPM4-0.5B",
+            "model_path": os.environ.get("MINICPM4_0P5B_MODEL_PATH", "/workspace/zhousc6@xiaopeng.com/MiniCPM4-0.5B"),
             "use_fast_tokenizer": None,
             "configs": [
                 ExperimentConfig("BF16 baseline", None, 1.0),
@@ -583,7 +646,10 @@ def main() -> None:
         },
         "internlm": {
             "model_path": _resolve_internlm_snapshot_path(
-                "../models--internlm--internlm2_5-1_8b"
+                os.environ.get(
+                    "INTERNLM_MODEL_ROOT",
+                    "/workspace/zhousc6@xiaopeng.com/models--internlm--internlm2_5-1_8b",
+                )
             ),
             "use_fast_tokenizer": None,
             "configs": [
@@ -594,7 +660,7 @@ def main() -> None:
             ],
         },
         "gemma3": {
-            "model_path": "../gemma-3-1b-it/",
+            "model_path": os.environ.get("GEMMA3_MODEL_PATH", "/workspace/zhousc6@xiaopeng.com/gemma-3-1b-it/"),
             "use_fast_tokenizer": None,
             "configs": [
                 ExperimentConfig("BF16 baseline", None, 1.0),
@@ -701,13 +767,14 @@ def main() -> None:
 
         for cfg in configs:
             print(f"\n[Run] {cfg.label} | bits={cfg.bits} | outlier={cfg.outlier_percentile}%")
+            scope_suffix = "_allblocks" if args.quantize_all_blocks else ""
             out_name = (
-                f"{model_key}_bf16.json"
+                f"{model_key}_bf16{scope_suffix}.json"
                 if cfg.bits is None
                 else (
-                    f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}.json"
+                    f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}{scope_suffix}.json"
                     if cfg.act_bits is None
-                    else f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}_act{cfg.act_bits}bit_actoutlier{cfg.act_outlier_percentile:g}.json"
+                    else f"{model_key}_{cfg.bits}bit_outlier{cfg.outlier_percentile:g}_act{cfg.act_bits}bit_actoutlier{cfg.act_outlier_percentile:g}{scope_suffix}.json"
                 )
             )
             out_path = results_dir / out_name
@@ -726,6 +793,7 @@ def main() -> None:
                 n_ctx=args.n_ctx,
                 stride=args.stride,
                 config=cfg,
+                quantize_all_blocks=bool(args.quantize_all_blocks),
                 seed=args.seed,
                 quantile_sample_size=args.quantile_sample_size,
                 act_calib_chars=args.act_calib_chars,
@@ -744,6 +812,7 @@ def main() -> None:
             for item in existing:
                 key = (
                     item.get("model_key"),
+                    str(item.get("target_layer_mode") or "middle"),
                     item.get("num_bits"),
                     float(item.get("outlier_percentile", 1.0)),
                     item.get("act_bits", None),
@@ -757,6 +826,7 @@ def main() -> None:
     for item in all_results:
         key = (
             item.get("model_key"),
+            str(item.get("target_layer_mode") or "middle"),
             item.get("num_bits"),
             float(item.get("outlier_percentile", 1.0)),
             item.get("act_bits", None),
@@ -768,6 +838,7 @@ def main() -> None:
     final_results.sort(
         key=lambda it: (
             str(it.get("model_key", "")),
+            str(it.get("target_layer_mode") or "middle"),
             0 if it.get("num_bits") is None else 1,
             0 if it.get("num_bits") is None else int(it.get("num_bits") or 0),
             float(it.get("outlier_percentile", 1.0)),

@@ -34,8 +34,34 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+def _load_dotenv(dotenv_path: Path) -> None:
+    try:
+        text = dotenv_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key:
+            os.environ.setdefault(key, val)
 
-DEFAULT_TEXT_PATH = "../swift_train/lgqm.txt"
+
+def _maybe_load_dotenv() -> None:
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env"]
+    for p in candidates:
+        if p.exists():
+            _load_dotenv(p)
+            break
+
+
+_maybe_load_dotenv()
+
+
+DEFAULT_TEXT_PATH = os.environ.get("SPEC_TEXT_PATH", "/workspace/zhousc6@xiaopeng.com/swift_train/lgqm.txt")
 
 
 @dataclass(frozen=True)
@@ -51,6 +77,8 @@ class SpecRow:
     act_calib_seq_len: int
     ppl: float
     quantile_sample_size: int
+    target_layers: List[int]
+    target_layer_mode: str
 
 
 def _latest_run_dir(results_root: Path) -> Path:
@@ -65,6 +93,9 @@ def _read_summary(run_dir: Path) -> List[SpecRow]:
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     rows: List[SpecRow] = []
     for item in payload:
+        target_layers_raw = item.get("target_layers") or []
+        target_layers = [int(v) for v in target_layers_raw]
+        target_layer_mode = str(item.get("target_layer_mode") or ("middle" if target_layers else "unknown"))
         rows.append(
             SpecRow(
                 model_key=str(item["model_key"]),
@@ -78,6 +109,8 @@ def _read_summary(run_dir: Path) -> List[SpecRow]:
                 act_calib_seq_len=int(item.get("act_calib_seq_len", 256)),
                 ppl=float(item.get("ppl", float("nan"))),
                 quantile_sample_size=int(item.get("quantile_sample_size", 0)),
+                target_layers=target_layers,
+                target_layer_mode=target_layer_mode,
             )
         )
     return rows
@@ -502,6 +535,8 @@ def main() -> None:
                 r.act_outlier_percentile,
                 r.act_calib_chars,
                 r.act_calib_seq_len,
+                str(r.target_layer_mode or "middle"),
+                tuple(int(v) for v in (r.target_layers or [])),
                 r.config,
             )
             for r in model_rows
@@ -516,6 +551,8 @@ def main() -> None:
                     "act_outlier_percentile": float(a_outlier),
                     "act_calib_chars": int(a_chars),
                     "act_calib_seq_len": int(a_seq),
+                    "target_layer_mode": str(layer_mode),
+                    "target_layers": list(target_layers),
                     "config_label": str(cfg_label),
                 }
                 for (
@@ -525,12 +562,15 @@ def main() -> None:
                     a_outlier,
                     a_chars,
                     a_seq,
+                    layer_mode,
+                    target_layers,
                     cfg_label,
                 ) in cfg_keys
             ],
             key=lambda d: (
                 int(d["num_bits"]),
                 float(d["outlier_percentile"]),
+                str(d.get("target_layer_mode", "middle")),
                 0 if d["act_bits"] is None else 1,
                 0 if d["act_bits"] is None else int(d["act_bits"]),
                 str(d["config_label"]),
@@ -567,7 +607,6 @@ def main() -> None:
             torch.cuda.empty_cache()
 
         model_results: List[Dict[str, Any]] = []
-        target_layers = list(range(1, num_layers - 1))
 
         for cfg in quant_cfgs:
             num_bits = int(cfg["num_bits"])
@@ -576,9 +615,16 @@ def main() -> None:
             act_outlier_percentile = float(cfg["act_outlier_percentile"])
             act_calib_chars = int(cfg["act_calib_chars"])
             act_calib_seq_len = int(cfg["act_calib_seq_len"])
+            target_layers = [int(v) for v in (cfg.get("target_layers") or [])]
+            if not target_layers:
+                target_layers = list(range(1, num_layers - 1))
+            target_layer_mode = str(cfg.get("target_layer_mode") or "middle")
+            scope_suffix = "_allblocks" if target_layer_mode == "all" else ""
 
             model, tok = _load_model_and_tokenizer(model_path, use_fast=use_fast)
-            bounds_cache = run_dir / "quantile_cache" / f"{model_key}_outlier{outlier_percentile:g}.json"
+            bounds_cache = run_dir / "quantile_cache" / f"{model_key}_outlier{outlier_percentile:g}{scope_suffix}.json"
+            if not bounds_cache.exists():
+                bounds_cache = run_dir / "quantile_cache" / f"{model_key}_outlier{outlier_percentile:g}.json"
             bounds = _load_or_build_bounds_cache(
                 cache_path=bounds_cache,
                 model=model,
@@ -600,8 +646,14 @@ def main() -> None:
                 act_cache = (
                     run_dir
                     / "activation_cache"
-                    / f"{model_key}_W{num_bits}_outlier{outlier_percentile:g}_A{int(act_bits)}_outlier{act_outlier_percentile:g}_seqlen{act_calib_seq_len}.json"
+                    / f"{model_key}_W{num_bits}_outlier{outlier_percentile:g}_A{int(act_bits)}_outlier{act_outlier_percentile:g}_seqlen{act_calib_seq_len}{scope_suffix}.json"
                 )
+                if not act_cache.exists():
+                    act_cache = (
+                        run_dir
+                        / "activation_cache"
+                        / f"{model_key}_W{num_bits}_outlier{outlier_percentile:g}_A{int(act_bits)}_outlier{act_outlier_percentile:g}_seqlen{act_calib_seq_len}.json"
+                    )
                 act_bounds = _load_or_build_activation_bounds_cache(
                     cache_path=act_cache,
                     model=model,
@@ -639,6 +691,8 @@ def main() -> None:
                     "act_outlier_percentile": act_outlier_percentile,
                     "act_calib_chars": act_calib_chars,
                     "act_calib_seq_len": act_calib_seq_len,
+                    "target_layer_mode": target_layer_mode,
+                    "target_layers": target_layers,
                     "activation_rel_l2_by_layer": act_err,
                     "weight_rel_l2_by_layer": w_rel_l2,
                     "weight_mse_by_layer": w_mse,
