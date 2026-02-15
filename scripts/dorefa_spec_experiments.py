@@ -166,6 +166,9 @@ def _compute_quantile_bounds(
     *,
     sample_size: int,
 ) -> Tuple[float, float]:
+    if float(outlier_percentile) <= 0.0:
+        wf = weight.detach()
+        return float(wf.min().item()), float(wf.max().item())
     # Keep (outlier_percentile)% on each tail unquantized, matching SPEC.md pseudocode.
     q = outlier_percentile / 100.0
     wf = weight.detach().float().reshape(-1)
@@ -187,6 +190,9 @@ def _compute_tensor_quantile_bounds(
     *,
     sample_size: int,
 ) -> Tuple[float, float]:
+    if float(outlier_percentile) <= 0.0:
+        tf = tensor.detach()
+        return float(tf.min().item()), float(tf.max().item())
     q = outlier_percentile / 100.0
     tf = tensor.detach().float().reshape(-1)
     if sample_size > 0 and tf.numel() > sample_size:
@@ -278,7 +284,23 @@ def _load_or_build_activation_bounds_cache(
     inputs = tokenizer(calib_text, return_tensors="pt", truncation=True, max_length=seq_len)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     out = model(**inputs, use_cache=False, output_hidden_states=True, return_dict=True)
-    hidden_states = list(out.hidden_states or [])
+    hidden_states = list(getattr(out, "hidden_states", None) or [])
+    if not hidden_states:
+        # Some remote-code models ignore `output_hidden_states=True` at the top level
+        # but wrap a regular HF text model in `model.model`.
+        inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            try:
+                inner_out = inner(
+                    input_ids=inputs.get("input_ids"),
+                    attention_mask=inputs.get("attention_mask", None),
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = list(getattr(inner_out, "hidden_states", None) or [])
+            except Exception:
+                hidden_states = []
     if not hidden_states:
         raise RuntimeError("Model did not return hidden_states; cannot calibrate activation quantization.")
 
@@ -364,10 +386,24 @@ def _calculate_ppl(
         target_ids[:, :-trg_len] = -100
 
         outputs = model(input_chunk, attention_mask=attn_chunk, labels=target_ids, use_cache=False)
-        loss = outputs.loss.float()
+        loss = getattr(outputs, "loss", None)
 
-        total_nll += (loss.item() * trg_len)
-        total_tokens += trg_len
+        if loss is not None:
+            total_nll += (loss.float().item() * trg_len)
+            total_tokens += trg_len
+        else:
+            logits = getattr(outputs, "logits", None)
+            if logits is None:
+                raise RuntimeError("Model output has neither `.loss` nor `.logits`; cannot compute PPL.")
+            logits = logits.float()
+            # Match HF causal LM loss: shift logits/labels by one.
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = target_ids[:, 1:].contiguous()
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+            nll = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            valid = int((shift_labels != -100).sum().item())
+            total_nll += float(nll.item())
+            total_tokens += valid
 
         prev_end_loc = end_loc
         if end_loc == seq_len:
@@ -388,9 +424,23 @@ def _generate_samples(
     temperature: float = 0.8,
     top_p: float = 0.9,
 ) -> List[Dict[str, str]]:
+    # MiniCPM-o is a multimodal/chat-style checkpoint. With raw free-form prompts,
+    # it tends to degenerate (e.g., repeating punctuation). Wrap prompts as a
+    # "continue this text" user message to get meaningful continuations.
+    tokenizer_name = tokenizer.__class__.__name__.lower()
+    use_chat_continue = "minicpmo" in tokenizer_name
+
     samples: List[Dict[str, str]] = []
     for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        if use_chat_continue and hasattr(tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": f"请续写以下文本：\n{prompt}"}]
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            prompt_text = prompt
+
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -399,8 +449,12 @@ def _generate_samples(
             top_p=top_p,
             pad_token_id=getattr(tokenizer, "pad_token_id", None),
         )
-        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        samples.append({"prompt": prompt, "continuation": generated[len(prompt) :].strip()})
+        # Decode only newly generated tokens (avoid brittle string slicing).
+        new_tokens = outputs[0, inputs["input_ids"].shape[1] :]
+        continuation = tokenizer.decode(
+            new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        ).strip()
+        samples.append({"prompt": prompt, "continuation": continuation})
     return samples
 
 
@@ -411,7 +465,27 @@ def _seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> Tuple[Any, Any]:
+def _unwrap_text_model(model: Any) -> Any:
+    """Return the text-only LLM module if `model` is a multimodal wrapper.
+
+    Some multimodal checkpoints (e.g. MiniCPM-o) wrap the causal LM in `model.llm`
+    and override `.generate()` to require vision inputs. For SPEC text-only eval,
+    we want to run/quantize the underlying LLM.
+    """
+
+    llm = getattr(model, "llm", None)
+    if llm is not None and hasattr(llm, "generate"):
+        return llm
+    return model
+
+
+def _load_model_and_tokenizer(
+    model_path: str,
+    *,
+    use_fast: Optional[bool],
+    torch_dtype: Optional[Any] = None,
+    device_map: Optional[str] = "auto",
+) -> Tuple[Any, Any]:
     tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
     if use_fast is not None:
         tokenizer_kwargs["use_fast"] = use_fast
@@ -419,18 +493,29 @@ def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> T
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model_kwargs: Dict[str, Any] = {
-        "torch_dtype": torch.bfloat16,
-        "trust_remote_code": True,
-    }
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16
+    model_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
-        model.to("cuda")
+        if torch.cuda.is_available():
+            model.to("cuda")
 
     model.eval()
+    text_model = _unwrap_text_model(model)
+    if text_model is not model:
+        # Keep tokenizer/config aligned after unwrapping.
+        if getattr(text_model.config, "pad_token_id", None) is None:
+            text_model.config.pad_token_id = tokenizer.pad_token_id
+        text_model.eval()
+        model = text_model
     return model, tokenizer
 
 
@@ -451,9 +536,18 @@ def _run_single(
     quantile_sample_size: int,
     act_calib_chars: int,
     act_calib_seq_len: int,
+    torch_dtype: Optional[Any] = None,
+    device_map: Optional[str] = "auto",
+    compute_ppl: bool = True,
+    existing_ppl: Optional[float] = None,
 ) -> Dict[str, Any]:
     _seed_all(seed)
-    model, tokenizer = _load_model_and_tokenizer(model_path, use_fast=use_fast_tokenizer)
+    model, tokenizer = _load_model_and_tokenizer(
+        model_path,
+        use_fast=use_fast_tokenizer,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+    )
 
     layers = _infer_layers(model)
     if quantize_all_blocks:
@@ -507,8 +601,11 @@ def _run_single(
             num_bits=int(config.act_bits),
         )
 
-    text = _load_text(text_path, max_chars=max_chars)
-    ppl = _calculate_ppl(model, tokenizer, text, n_ctx=n_ctx, stride=stride)
+    if compute_ppl:
+        text = _load_text(text_path, max_chars=max_chars)
+        ppl = _calculate_ppl(model, tokenizer, text, n_ctx=n_ctx, stride=stride)
+    else:
+        ppl = float(existing_ppl) if existing_ppl is not None else float("nan")
     samples = _generate_samples(model, tokenizer, prompts)
     for h in hooks:
         h.remove()
@@ -566,7 +663,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         default="qwen3,minicpm,internlm,gemma3",
-        help="Comma-separated model keys to run: qwen3,minicpm,internlm,gemma3",
+        help="Comma-separated model keys to run: qwen3,qwen3_30b_fp8,minicpm,minicpm4_0p5b,minicpm_o_4_5,step_audio_2_mini,step_audio_tts_3b,step_audio_editx,internlm,gemma3",
     )
     parser.add_argument(
         "--include-wa",
@@ -582,6 +679,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-existing",
         action="store_true",
         help="Skip configs whose output JSON already exists in --results-dir.",
+    )
+    parser.add_argument(
+        "--refresh-samples",
+        action="store_true",
+        help="If an output JSON already exists, regenerate only the continuation samples and update the file (reuse existing PPL).",
     )
     parser.add_argument(
         "--config-set",
@@ -624,6 +726,20 @@ def main() -> None:
                 ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
             ],
         },
+        "qwen3_30b_fp8": {
+            "model_path": os.environ.get(
+                "QWEN3_30B_FP8_MODEL_PATH",
+                "/publicdata/huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+            ),
+            "use_fast_tokenizer": False,
+            "torch_dtype": "auto",
+            "device_map": "cuda",
+            "baseline_tag": "fp8",
+            "configs": [
+                ExperimentConfig("FP8 baseline", None, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+            ],
+        },
         "minicpm": {
             "model_path": os.environ.get("MINICPM_MODEL_PATH", "/workspace/zhousc6@xiaopeng.com/MiniCPM-2B-sft-bf16/"),
             "use_fast_tokenizer": None,
@@ -641,6 +757,78 @@ def main() -> None:
                 ExperimentConfig("BF16 baseline", None, 1.0),
                 ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
                 ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "minicpm_o_4_5": {
+            "model_path": os.environ.get(
+                "MINICPMO_4_5_MODEL_PATH",
+                "/workspace/zhousc6@xiaopeng.com/MiniCPM-o-4_5",
+            ),
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "step_audio_2_mini": {
+            "model_path": os.environ.get(
+                "STEP_AUDIO_2_MINI_MODEL_PATH",
+                "/workspace/zhousc6@xiaopeng.com/Step-Audio-2-mini-text",
+            ),
+            "use_fast_tokenizer": None,
+            # Text-only eval: use the Qwen2 text backbone only; keep configs small (model is large).
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "step_audio_tts_3b": {
+            "model_path": os.environ.get(
+                "STEP_AUDIO_TTS_3B_MODEL_PATH",
+                "/publicdata/huggingface.co/models/stepfun-ai/Step-Audio-TTS-3B/main",
+            ),
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
+            ],
+        },
+        "step_audio_editx": {
+            "model_path": os.environ.get(
+                "STEP_AUDIO_EDITX_MODEL_PATH",
+                "/publicdata/huggingface.co/models/stepfun-ai/Step-Audio-EditX/main",
+            ),
+            "use_fast_tokenizer": None,
+            "configs": [
+                ExperimentConfig("BF16 baseline", None, 1.0),
+                ExperimentConfig("4-bit W (1.0%)", 4, 1.0),
+                ExperimentConfig(
+                    "4-bit W + 6-bit A (1%)",
+                    bits=4,
+                    outlier_percentile=1.0,
+                    act_bits=6,
+                    act_outlier_percentile=1.0,
+                ),
+                ExperimentConfig("6-bit W (1.0%)", 6, 1.0),
+                ExperimentConfig(
+                    "6-bit W+A (0%)",
+                    bits=6,
+                    outlier_percentile=0.0,
+                    act_bits=6,
+                    act_outlier_percentile=0.0,
+                ),
+                ExperimentConfig(
+                    "6-bit W(outlier=0%)+A(outlier=0.1%)",
+                    bits=6,
+                    outlier_percentile=0.0,
+                    act_bits=6,
+                    act_outlier_percentile=0.1,
+                ),
                 ExperimentConfig("8-bit W (1.0%)", 8, 1.0),
             ],
         },
@@ -769,8 +957,9 @@ def main() -> None:
             cfg_run = cfg.with_prefix("[ALLBLOCKS] " if args.quantize_all_blocks else "")
             print(f"\n[Run] {cfg_run.label} | bits={cfg_run.bits} | outlier={cfg_run.outlier_percentile}%")
             scope_suffix = "_allblocks" if args.quantize_all_blocks else ""
+            baseline_tag = spec.get("baseline_tag", "bf16")
             out_name = (
-                f"{model_key}_bf16{scope_suffix}.json"
+                f"{model_key}_{baseline_tag}{scope_suffix}.json"
                 if cfg_run.bits is None
                 else (
                     f"{model_key}_{cfg_run.bits}bit_outlier{cfg_run.outlier_percentile:g}{scope_suffix}.json"
@@ -779,9 +968,16 @@ def main() -> None:
                 )
             )
             out_path = results_dir / out_name
-            if args.skip_existing and out_path.exists():
-                print(f"[Skip] Exists: {out_path}")
-                continue
+            existing_payload: Optional[Dict[str, Any]] = None
+            if out_path.exists():
+                if args.refresh_samples:
+                    try:
+                        existing_payload = json.loads(out_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        existing_payload = None
+                elif args.skip_existing:
+                    print(f"[Skip] Exists: {out_path}")
+                    continue
 
             payload = _run_single(
                 model_key=model_key,
@@ -799,6 +995,10 @@ def main() -> None:
                 quantile_sample_size=args.quantile_sample_size,
                 act_calib_chars=args.act_calib_chars,
                 act_calib_seq_len=args.act_calib_seq_len,
+                torch_dtype=spec.get("torch_dtype"),
+                device_map=spec.get("device_map", "auto"),
+                compute_ppl=(existing_payload is None),
+                existing_ppl=(None if existing_payload is None else existing_payload.get("ppl")),
             )
 
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

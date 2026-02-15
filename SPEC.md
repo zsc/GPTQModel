@@ -282,9 +282,18 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=80):
         temperature=0.8,
         top_p=0.9,
     )
-    generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return generated[len(prompt):].strip()
+    # 只解码新增 token，避免用字符串切片导致对齐不稳定（参考实现一致）。
+    new_tokens = outputs[0, inputs["input_ids"].shape[1] :]
+    continuation = tokenizer.decode(
+        new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    ).strip()
+    return continuation
 ```
+
+**对齐要求（参考实现）**  
+- 每个实验配置（即每条 PPL 记录）都使用同一组 `SAMPLE_PROMPTS` 生成续写，保证横向可比。  
+- 参考实现会把每条记录的续写样例写入 JSON：`samples=[{"prompt":..., "continuation":...}, ...]`。  
+- `report.html / report.pdf` 会为 **每条 PPL 记录** 展示对齐的续写样例（与该行配置一一对应）。  
 
 ### 5.3 逐层误差指标（Layer Error）
 

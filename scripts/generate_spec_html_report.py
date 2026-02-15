@@ -187,89 +187,28 @@ def _pick_baseline(model_rows: List[Row]) -> Optional[Row]:
 def _short_config_name(row: Row) -> str:
     if row.num_bits is None:
         return "BF16"
-    name = f"{row.num_bits}-bit"
-    if row.outlier_percentile != 1.0:
-        name += f" ({row.outlier_percentile:g}%)"
+    name = f"W{int(row.num_bits)} ({row.outlier_percentile:g}%)"
     if row.act_bits is not None:
-        name += "+A"
+        name += f" + A{int(row.act_bits)} ({row.act_outlier_percentile:g}%)"
     return name
 
 
 def _select_rows_for_samples(model_key: str, model_rows: List[Row]) -> List[Row]:
-    baseline = _pick_baseline(model_rows)
-    quantized = [r for r in model_rows if r.num_bits is not None]
-
-    selected: List[Row] = []
-    if baseline is not None:
-        selected.append(baseline)
-
-    def find(
-        bits: int,
-        outlier: float,
-        *,
-        with_act: bool,
-        act_outlier: Optional[float] = None,
-    ) -> Optional[Row]:
-        return next(
-            (
-                r
-                for r in quantized
-                if r.num_bits == bits
-                and abs(r.outlier_percentile - outlier) < 1e-9
-                and ((r.act_bits is not None) == with_act)
-                and (
-                    (act_outlier is None)
-                    or (r.act_bits is not None and abs(r.act_outlier_percentile - act_outlier) < 1e-9)
-                )
-            ),
-            None,
-        )
-
-    # Default columns (outlier=1.0)
-    for cand in (
-        find(8, 1.0, with_act=False),
-        find(6, 1.0, with_act=False),
-        find(4, 1.0, with_act=False),
-    ):
-        if cand is not None and cand not in selected:
-            selected.append(cand)
-
-    # Also include W+A rows when present (only for W>=6 by our runner).
-    for cand in (
-        find(8, 1.0, with_act=True, act_outlier=1.0),
-        find(6, 1.0, with_act=True, act_outlier=1.0),
-    ):
-        if cand is not None and cand not in selected:
-            selected.append(cand)
-
-    # Outlier=0% ablations (when present)
-    for cand in (
-        find(8, 0.0, with_act=False),
-        find(6, 0.0, with_act=False),
-    ):
-        if cand is not None and cand not in selected:
-            selected.append(cand)
-    for cand in (
-        find(8, 0.0, with_act=True, act_outlier=0.0),
-        find(6, 0.0, with_act=True, act_outlier=0.0),
-    ):
-        if cand is not None and cand not in selected:
-            selected.append(cand)
-
-    # SPEC has extra Qwen configs (0.1% outlier)
-    if model_key == "qwen3":
-        for cand in (
-            find(5, 0.1, with_act=False),
-            find(6, 0.1, with_act=False),
-        ):
-            if cand is not None and cand not in selected:
-                selected.append(cand)
-
-    if len(selected) <= 1 and quantized:
-        best = min(quantized, key=lambda r: r.ppl)
-        selected.append(best)
-
-    return selected
+    # SPEC requirement: every PPL record must include aligned continuation samples
+    # (same prompts) for apples-to-apples comparison across configs.
+    _ = model_key
+    return sorted(
+        model_rows,
+        key=lambda r: (
+            r.num_bits is not None,
+            0 if r.num_bits is None else int(r.num_bits),
+            float(r.outlier_percentile),
+            0 if r.act_bits is None else 1,
+            0 if r.act_bits is None else int(r.act_bits),
+            float(r.act_outlier_percentile),
+            r.config,
+        ),
+    )
 
 
 def _render_samples_table(row: Row) -> str:
@@ -295,15 +234,7 @@ def _render_model_section(run_dir: Path, model_key: str, model_rows: List[Row]) 
     baseline = _pick_baseline(model_rows)
     baseline_ppl = baseline.ppl if baseline is not None else float("nan")
 
-    rows_sorted = sorted(
-        model_rows,
-        key=lambda r: (
-            r.num_bits is not None,
-            0 if r.num_bits is None else int(r.num_bits),
-            float(r.outlier_percentile),
-            r.config,
-        ),
-    )
+    rows_sorted = _select_rows_for_samples(model_key, model_rows)
 
     table_lines: List[str] = []
     for r in rows_sorted:
@@ -326,7 +257,7 @@ def _render_model_section(run_dir: Path, model_key: str, model_rows: List[Row]) 
             "</tr>"
         )
 
-    sample_rows = _select_rows_for_samples(model_key, model_rows)
+    sample_rows = rows_sorted
     sample_blocks: List[str] = []
     for r in sample_rows:
         diff_pct = (

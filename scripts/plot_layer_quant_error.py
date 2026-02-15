@@ -169,6 +169,9 @@ def _compute_quantile_bounds(
     *,
     sample_size: int,
 ) -> Tuple[float, float]:
+    if float(outlier_percentile) <= 0.0:
+        wf = weight.detach()
+        return float(wf.min().item()), float(wf.max().item())
     q = outlier_percentile / 100.0
     wf = weight.detach().float().reshape(-1)
     if sample_size > 0 and wf.numel() > sample_size:
@@ -219,6 +222,9 @@ def _compute_tensor_quantile_bounds(
     *,
     sample_size: int,
 ) -> Tuple[float, float]:
+    if float(outlier_percentile) <= 0.0:
+        tf = tensor.detach()
+        return float(tf.min().item()), float(tf.max().item())
     q = outlier_percentile / 100.0
     tf = tensor.detach().float().reshape(-1)
     if sample_size > 0 and tf.numel() > sample_size:
@@ -249,7 +255,21 @@ def _load_or_build_activation_bounds_cache(
     inputs = tokenizer(calib_text, return_tensors="pt", truncation=True, max_length=seq_len)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     out = model(**inputs, use_cache=False, output_hidden_states=True, return_dict=True)
-    hidden_states = list(out.hidden_states or [])
+    hidden_states = list(getattr(out, "hidden_states", None) or [])
+    if not hidden_states:
+        inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            try:
+                inner_out = inner(
+                    input_ids=inputs.get("input_ids"),
+                    attention_mask=inputs.get("attention_mask", None),
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = list(getattr(inner_out, "hidden_states", None) or [])
+            except Exception:
+                hidden_states = []
     if not hidden_states:
         raise RuntimeError("Model did not return hidden_states; cannot calibrate activation quantization.")
 
@@ -346,7 +366,24 @@ def _hidden_states_for_text(model, tokenizer, text: str, *, seq_len: int) -> Lis
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     out = model(**inputs, use_cache=False, output_hidden_states=True, return_dict=True)
-    hidden_states = list(out.hidden_states or [])
+    hidden_states = list(getattr(out, "hidden_states", None) or [])
+    if not hidden_states:
+        # Some remote-code models do not plumb `output_hidden_states=True` through their
+        # top-level forward() (e.g. wrappers around an inner HF model). Try the inner
+        # `model.model` as a fallback.
+        inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            try:
+                inner_out = inner(
+                    input_ids=inputs.get("input_ids"),
+                    attention_mask=inputs.get("attention_mask", None),
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = list(getattr(inner_out, "hidden_states", None) or [])
+            except Exception:
+                hidden_states = []
     if not hidden_states:
         raise RuntimeError("Model did not return hidden_states; cannot compute activation error.")
     return hidden_states
@@ -390,6 +427,12 @@ def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> T
         model.to("cuda")
 
     model.eval()
+    llm = getattr(model, "llm", None)
+    if llm is not None and hasattr(llm, "generate"):
+        if getattr(llm.config, "pad_token_id", None) is None:
+            llm.config.pad_token_id = tokenizer.pad_token_id
+        llm.eval()
+        model = llm
     return model, tokenizer
 
 
