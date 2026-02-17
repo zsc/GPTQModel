@@ -147,6 +147,30 @@ def _iter_layer_weights(
                 if proj is not None and hasattr(proj, "weight"):
                     yield layer_idx, f"layer{layer_idx}.mlp.{proj_name}.weight", proj.weight
 
+            # Qwen3-MoE style experts
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                for expert_idx, expert in enumerate(experts):
+                    for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                        proj = getattr(expert, proj_name, None)
+                        if proj is not None and hasattr(proj, "weight"):
+                            yield (
+                                layer_idx,
+                                f"layer{layer_idx}.mlp.experts.{expert_idx}.{proj_name}.weight",
+                                proj.weight,
+                            )
+
+            shared_expert = getattr(mlp, "shared_expert", None)
+            if shared_expert is not None:
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    proj = getattr(shared_expert, proj_name, None)
+                    if proj is not None and hasattr(proj, "weight"):
+                        yield (
+                            layer_idx,
+                            f"layer{layer_idx}.mlp.shared_expert.{proj_name}.weight",
+                            proj.weight,
+                        )
+
         # InternLM2-style
         attn2 = getattr(layer, "attention", None)
         if attn2 is not None:
@@ -411,7 +435,13 @@ def _activation_error_by_layer(
     return errors
 
 
-def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> Tuple[Any, Any]:
+def _load_model_and_tokenizer(
+    model_path: str,
+    *,
+    use_fast: Optional[bool],
+    torch_dtype: Optional[Any] = None,
+    device_map: Optional[str] = "cuda",
+) -> Tuple[Any, Any]:
     tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
     if use_fast is not None:
         tokenizer_kwargs["use_fast"] = use_fast
@@ -419,9 +449,15 @@ def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> T
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model_kwargs: Dict[str, Any] = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map=device_map, **model_kwargs)
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         model.to("cuda")
@@ -437,7 +473,26 @@ def _load_model_and_tokenizer(model_path: str, *, use_fast: Optional[bool]) -> T
 
 
 def _use_fast_tokenizer_for_model(model_key: str) -> Optional[bool]:
-    return False if model_key == "qwen3" else None
+    return False if model_key in ("qwen3", "qwen3_30b_fp8", "qwen3_30b_a3b_fp8") else None
+
+
+def _infer_torch_dtype_for_model(model_path: str) -> Optional[Any]:
+    """Infer a reasonable torch_dtype for loading.
+
+    For pre-quantized FP8 checkpoints, `torch_dtype="auto"` is important to keep
+    the quantization wrappers consistent with the checkpoint metadata.
+    """
+
+    try:
+        cfg_path = Path(model_path) / "config.json"
+        if cfg_path.exists():
+            payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+            quant_cfg = payload.get("quantization_config") or {}
+            if str(quant_cfg.get("quant_method", "")).lower() == "fp8":
+                return "auto"
+    except Exception:
+        pass
+    return torch.bfloat16
 
 
 def _load_text(text_path: str, max_chars: int) -> str:
@@ -635,7 +690,10 @@ def main() -> None:
         print(f"  seq_len={args.seq_len} | text_chars={args.text_chars} | quantile_sample_size={sample_size}")
 
         # Baseline hidden states
-        base_model, base_tok = _load_model_and_tokenizer(model_path, use_fast=use_fast)
+        torch_dtype = _infer_torch_dtype_for_model(model_path)
+        base_model, base_tok = _load_model_and_tokenizer(
+            model_path, use_fast=use_fast, torch_dtype=torch_dtype, device_map="cuda"
+        )
         layers = _infer_layers(base_model)
         num_layers = len(layers)
         if args.include_ends:
@@ -664,7 +722,9 @@ def main() -> None:
             target_layer_mode = str(cfg.get("target_layer_mode") or "middle")
             scope_suffix = "_allblocks" if target_layer_mode == "all" else ""
 
-            model, tok = _load_model_and_tokenizer(model_path, use_fast=use_fast)
+            model, tok = _load_model_and_tokenizer(
+                model_path, use_fast=use_fast, torch_dtype=torch_dtype, device_map="cuda"
+            )
             bounds_cache = run_dir / "quantile_cache" / f"{model_key}_outlier{outlier_percentile:g}{scope_suffix}.json"
             if not bounds_cache.exists():
                 bounds_cache = run_dir / "quantile_cache" / f"{model_key}_outlier{outlier_percentile:g}.json"

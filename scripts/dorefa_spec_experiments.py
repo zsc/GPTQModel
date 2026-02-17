@@ -142,6 +142,27 @@ def _iter_target_weights(
                     continue
                 yield f"layer{layer_idx}.mlp.{proj_name}.weight", proj.weight
 
+            # Qwen3-MoE style experts: mlp.experts[i].{gate,up,down}_proj
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                for expert_idx, expert in enumerate(experts):
+                    for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                        proj = getattr(expert, proj_name, None)
+                        if proj is None or not hasattr(proj, "weight"):
+                            continue
+                        yield (
+                            f"layer{layer_idx}.mlp.experts.{expert_idx}.{proj_name}.weight",
+                            proj.weight,
+                        )
+
+            shared_expert = getattr(mlp, "shared_expert", None)
+            if shared_expert is not None:
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    proj = getattr(shared_expert, proj_name, None)
+                    if proj is None or not hasattr(proj, "weight"):
+                        continue
+                    yield f"layer{layer_idx}.mlp.shared_expert.{proj_name}.weight", proj.weight
+
         # InternLM2-style attention/feed-forward.
         attn = getattr(layer, "attention", None)
         if attn is not None:
@@ -500,6 +521,16 @@ def _load_model_and_tokenizer(
         model_kwargs["torch_dtype"] = torch_dtype
     if device_map is not None:
         model_kwargs["device_map"] = device_map
+    model_kwargs.setdefault("low_cpu_mem_usage", True)
+
+    # Some environments set WORLD_SIZE=1 even when not launched via torchrun, which
+    # makes Transformers interpret device_map="auto" as TP and require LOCAL_RANK.
+    if (
+        model_kwargs.get("device_map") == "auto"
+        and int(os.environ.get("WORLD_SIZE", "0") or "0") > 0
+        and not os.environ.get("LOCAL_RANK")
+    ):
+        model_kwargs["device_map"] = "cuda" if torch.cuda.is_available() else None
 
     try:
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -516,6 +547,14 @@ def _load_model_and_tokenizer(
             text_model.config.pad_token_id = tokenizer.pad_token_id
         text_model.eval()
         model = text_model
+    # Ensure the model is on GPU when available; FP8 checkpoints can default to CPU.
+    if torch.cuda.is_available():
+        try:
+            param_device = next(model.parameters()).device
+        except StopIteration:
+            param_device = torch.device("cpu")
+        if param_device.type == "cpu":
+            model.to("cuda")
     return model, tokenizer
 
 
